@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 try:
@@ -14,6 +18,7 @@ except ImportError:
 
 from providers import create_provider
 from reliability import run_agent_reliable
+from tools import WORKSPACE
 
 
 DEFAULT_MODEL = "gemini-3.6-flash"
@@ -131,6 +136,38 @@ def resolve_files(paths: list[str]) -> list[Path]:
 
     return resolved_files
 
+
+@contextmanager
+def stage_challenge_files(files: list[Path]) -> Iterator[list[Path]]:
+    """Copy explicitly provided challenge files into the tools' safe workspace.
+
+    The temporary directory lives under WORKSPACE so every staged file passes
+    tools._safe_file(), and is removed when the agent run finishes.
+    """
+    if not files:
+        yield []
+        return
+
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".run-", dir=WORKSPACE) as temp_dir:
+        staging_root = Path(temp_dir)
+        staged_files: list[Path] = []
+
+        for index, source_path in enumerate(files, start=1):
+            source = Path(source_path).resolve(strict=True)
+            if not source.is_file():
+                raise ValueError(f"Challenge input is not a file: {source_path}")
+
+            # One directory per input prevents collisions when files share a name.
+            target_dir = staging_root / f"{index:03d}"
+            target_dir.mkdir()
+            target = target_dir / source.name
+            shutil.copyfile(source, target)
+            staged_files.append(target)
+
+        yield staged_files
+
+
 def build_task(task: str, files: list[Path]) -> str:
     """
     사용자 요청과 challenge 파일 정보를 하나의 Agent task로 합친다.
@@ -144,10 +181,17 @@ def build_task(task: str, files: list[Path]) -> str:
         parts.append("\nProvided challenge files:")
 
         for path in files:
-            parts.append(f"- {path}")
+            try:
+                relative_path = path.resolve().relative_to(WORKSPACE).as_posix()
+            except ValueError as exc:
+                raise ValueError(
+                    "Challenge files must be staged inside workspace/ before building the task"
+                ) from exc
+            parts.append(f"- {relative_path}")
 
         parts.append(
-            "\nInspect these files using the available tools before "
+            "\nThese paths are relative to workspace/. Inspect the files "
+            "using the available tools before "
             "drawing conclusions."
         )
 
@@ -164,22 +208,23 @@ def run_task(
     if files is None:
         files = []
 
-    full_task = build_task(
-        task=task,
-        files=files,
-    )
+    with stage_challenge_files(files) as staged_files:
+        full_task = build_task(
+            task=task,
+            files=staged_files,
+        )
 
-    provider = create_provider(
-        "gemini",
-        model,
-    )
+        provider = create_provider(
+            "gemini",
+            model,
+        )
 
-    return run_agent_reliable(
-        task=full_task,
-        provider=provider,
-        system_prompt=PWNABLE_SYSTEM_PROMPT,
-        verbose=verbose,
-    )
+        return run_agent_reliable(
+            task=full_task,
+            provider=provider,
+            system_prompt=PWNABLE_SYSTEM_PROMPT,
+            verbose=verbose,
+        )
 
 
 def run_interactive(
