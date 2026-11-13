@@ -10,12 +10,14 @@ import ast
 import operator
 import re
 import subprocess
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 # Always anchored to this module's directory, not the process working directory.
 WORKSPACE = (Path(__file__).resolve().parent / "workspace").resolve()
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MiB per inspected file
+MAX_EXPLOIT_SIZE = 100 * 1024     # 100 KiB per generated exploit
 MAX_OUTPUT = 8000                 # characters returned to the LLM per tool call
 COMMAND_TIMEOUT = 10              # seconds per external command
 
@@ -251,6 +253,42 @@ def calculate(expression: str) -> str:
         return f"Error: {exc}"
 
 
+def write_exploit(code: str) -> str:
+    """Save syntactically valid Python source to workspace/exploit.py without running it."""
+    if not isinstance(code, str) or not code.strip():
+        return "Error: exploit source must be a non-empty string"
+    if len(code.encode("utf-8")) > MAX_EXPLOIT_SIZE:
+        return f"Error: exploit source exceeds {MAX_EXPLOIT_SIZE // 1024} KiB"
+    try:
+        compile(code, "exploit.py", "exec")
+    except (SyntaxError, ValueError) as exc:
+        line = getattr(exc, "lineno", None)
+        return f"Error: exploit source has invalid Python syntax at line {line}: {exc}"
+
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    target = WORKSPACE / "exploit.py"
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=WORKSPACE,
+            prefix=".exploit-",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_file.write(code)
+            temp_path = Path(temp_file.name)
+        temp_path.replace(target)
+    except OSError as exc:
+        return f"Error: could not save exploit source: {exc}"
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+    return "Saved syntactically valid exploit source to workspace/exploit.py. It was not executed."
+
+
 def get_current_date() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -265,6 +303,7 @@ TOOL_FUNCTIONS = {
     "extract_strings": extract_strings,
     "disassemble": disassemble,
     "calculate": calculate,
+    "write_exploit": write_exploit,
     "get_current_date": get_current_date,
 }
 
@@ -310,6 +349,9 @@ TOOL_SCHEMAS: list[dict] = [
     _schema("calculate", "Basic arithmetic and integer bitwise operations, including hex addresses. No Python function calls.", {
         "expression": {"type": "string", "description": "Expression, e.g. '2 ** 10' or '0x401000 + 0x30'"},
     }, ["expression"]),
+    _schema("write_exploit", "Save valid Python exploit source to workspace/exploit.py (replaces an existing generated file). Syntax is checked; the code is never executed.", {
+        "code": {"type": "string", "description": "Complete Python source code for the authorized CTF exploit."},
+    }, ["code"]),
     _schema("get_current_date", "Return local date and time.", {}, []),
 ]
 

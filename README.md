@@ -67,4 +67,6 @@ Agent에게 Web, Pwnable 등 분야별 보안 도구와 실행 환경을 제공�
 python agent.py --file ./challenge --output analysis.md "Analyze this pwnable challenge"
 ```
 
-`--output`은 `.md`와 `.txt` 확장자를 지원하며, 대화형 모드에서는 사용할 수 없습니다.
+`--output`은 `.md`와 `.txt` 확장자를 지원하며, 대화형 모드에서는 사용할 수 없습니다. 보고서에는 입력 작업, 도구 호출 과정, 도구 결과, 최종 답변이 포함됩니다.
+
+Agent가 익스플로잇 코드를 작성하면 문법을 확인한 뒤 `workspace/exploit.py`에 저장합니다. 저장된 코드는 자동으로 실행하지 않습니다.

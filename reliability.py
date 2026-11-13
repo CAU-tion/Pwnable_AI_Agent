@@ -34,6 +34,22 @@ from tools import TOOL_SCHEMAS, call_tool
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S", level=logging.INFO)
 _log = logging.getLogger("reliability")
 
+
+def _is_retryable_exception(exc: Exception) -> bool:
+    """Return whether an exception is likely to clear without changing inputs."""
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code in {408, 409, 429} or status_code >= 500
+
+    exception_names = {base.__name__.lower() for base in type(exc).__mro__}
+    if any(
+        "timeout" in name or "connection" in name or "network" in name
+        for name in exception_names
+    ):
+        return True
+    return isinstance(exc, (TimeoutError, ConnectionError))
+
+
 # Build a name → parameters-schema index once at import time.
 _SCHEMAS: dict[str, dict] = {
     s["function"]["name"]: s["function"]["parameters"]
@@ -51,12 +67,12 @@ def with_retry(
     max_attempts: int = 3,
     base_delay: float = 1.0,
 ) -> str:
-    """Call fn(**args), retrying up to max_attempts times on any exception."""
+    """Call fn(**args), retrying transient failures up to max_attempts times."""
     for attempt in range(max_attempts):
         try:
             return fn(**args)
         except Exception as e:
-            if attempt == max_attempts - 1:
+            if attempt == max_attempts - 1 or not _is_retryable_exception(e):
                 raise
             delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
             _log.warning("attempt %d failed (%s) — retrying in %.1fs", attempt + 1, e, delay)
@@ -243,7 +259,7 @@ def run_agent_reliable(
 # -------------------------------------------------
 
 class _RetryingProvider:
-    """Wraps any LLMProvider and adds exponential-backoff retry to complete()."""
+    """Wraps any LLMProvider and retries transient complete() failures."""
 
     def __init__(self, inner, max_retries: int = 5, base_delay: float = 2.0) -> None:
         self._inner = inner
@@ -255,7 +271,7 @@ class _RetryingProvider:
             try:
                 return self._inner.complete(messages, tools)
             except Exception as e:
-                if attempt == self._max_retries - 1:
+                if attempt == self._max_retries - 1 or not _is_retryable_exception(e):
                     raise
                 delay = self._base_delay * (2 ** attempt) + random.uniform(0, 1.0)
                 _log.warning(
