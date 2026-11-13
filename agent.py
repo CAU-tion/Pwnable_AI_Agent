@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 import tempfile
@@ -88,6 +89,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "-q",
         action="store_true",
         help="Hide tool execution trace.",
+    )
+
+    parser.add_argument(
+        "--output",
+        "-o",
+        help="Write the task, tool trace, and final answer to a .md or .txt report.",
     )
 
     parser.add_argument(
@@ -198,15 +205,100 @@ def build_task(task: str, files: list[Path]) -> str:
     return "\n".join(parts)
 
 
+def write_analysis_report(
+    report_path: str | Path,
+    task: str,
+    answer: str,
+    events: list[dict],
+) -> Path:
+    """Write the final answer and observed tool trace to Markdown or text."""
+    path = Path(report_path).expanduser()
+    suffix = path.suffix.lower()
+    if suffix not in {".md", ".txt"}:
+        raise ValueError("Report path must end with .md or .txt")
+
+    tool_calls = [event for event in events if event.get("event") == "tool_call"]
+    if suffix == ".md":
+        lines = [
+            "# Pwnable Analysis Report",
+            "",
+            "## Task",
+            "",
+            task,
+            "",
+            "## Analysis process",
+            "",
+        ]
+        if tool_calls:
+            for event in tool_calls:
+                args = json.dumps(event.get("args", {}), ensure_ascii=False, sort_keys=True)
+                lines.extend(
+                    [
+                        f"### Step {event.get('step', '?')}: `{event.get('tool', 'unknown')}`",
+                        "",
+                        f"Arguments: `{args}`",
+                        "",
+                        "Result:",
+                    ]
+                )
+                result = str(event.get("result", ""))
+                quoted_result = [f"> {line}" if line else ">" for line in result.splitlines()]
+                lines.extend(quoted_result or [">"])
+                lines.append("")
+        else:
+            lines.extend(["No tools were called.", ""])
+        lines.extend(["## Final answer", "", answer, ""])
+    else:
+        lines = [
+            "PWNABLE ANALYSIS REPORT",
+            "=" * 24,
+            "",
+            "TASK",
+            "----",
+            task,
+            "",
+            "ANALYSIS PROCESS",
+            "-----------------",
+        ]
+        if tool_calls:
+            for event in tool_calls:
+                args = json.dumps(event.get("args", {}), ensure_ascii=False, sort_keys=True)
+                lines.extend([
+                    f"Step {event.get('step', '?')}: {event.get('tool', 'unknown')}",
+                    f"Arguments: {args}",
+                    "Result:",
+                    str(event.get("result", "")),
+                    "",
+                ])
+        else:
+            lines.extend(["No tools were called.", ""])
+        lines.extend(["FINAL ANSWER", "------------", answer, ""])
+
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
 def run_task(
     task: str,
     model: str,
     files: list[Path] | None = None,
     verbose: bool = True,
+    report_path: str | Path | None = None,
 ) -> str:
 
     if files is None:
         files = []
+
+    if report_path is not None:
+        report = Path(report_path).expanduser()
+        if report.suffix.lower() not in {".md", ".txt"}:
+            raise ValueError("Report path must end with .md or .txt")
+        if report.exists() and report.is_dir():
+            raise ValueError("Report path points to a directory")
+        if report.resolve() in {Path(file).resolve() for file in files}:
+            raise ValueError("Report path cannot overwrite a provided challenge file")
 
     with stage_challenge_files(files) as staged_files:
         full_task = build_task(
@@ -219,12 +311,17 @@ def run_task(
             model,
         )
 
-        return run_agent_reliable(
+        events: list[dict] = []
+        answer = run_agent_reliable(
             task=full_task,
             provider=provider,
             system_prompt=PWNABLE_SYSTEM_PROMPT,
             verbose=verbose,
+            event_callback=events.append if report_path is not None else None,
         )
+        if report_path is not None:
+            write_analysis_report(report_path, full_task, answer, events)
+        return answer
 
 
 def run_interactive(
@@ -303,6 +400,8 @@ def main() -> None:
     print()
 
     if args.interactive:
+        if args.output:
+            parser.error("--output cannot be combined with --interactive")
         run_interactive(
             model=args.model,
             files=challenge_files,
@@ -331,9 +430,12 @@ def main() -> None:
             model=args.model,
             files=challenge_files,
             verbose=verbose,
+            report_path=args.output,
         )
 
         print(f"\nAnswer: {answer}\n")
+        if args.output:
+            print(f"Report written to: {Path(args.output).expanduser().resolve()}")
 
     except KeyboardInterrupt:
         print("\nInterrupted.")

@@ -23,7 +23,8 @@ import random
 import re
 import time
 from collections import defaultdict
-from typing import Callable, Optional
+from collections.abc import Callable
+from typing import Optional
 
 from pydantic import ValidationError, create_model
 
@@ -211,6 +212,7 @@ def run_agent_reliable(
     llm_max_retries: int = 5,
     circuit_failure_threshold: int = 3,
     circuit_reset_timeout: float = 30.0,
+    event_callback: Callable[[dict], None] | None = None,
 ) -> str:
     """
     run_agent() with retry, circuit breaker, schema validation, and tracing
@@ -232,6 +234,7 @@ def run_agent_reliable(
         system_prompt=system_prompt,
         verbose=verbose,
         tool_dispatcher=_make_dispatcher(breakers, max_retries),
+        event_callback=event_callback,
     )
 
 

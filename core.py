@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 from providers import LLMProvider, LLMMessage
@@ -78,6 +79,7 @@ def run_agent(
     _spinner: Spinner | None = None,
     max_steps : int = 30,
     run_id: str | None = None,
+    event_callback: Callable[[dict], None] | None = None,
 ) -> str:
     """
     Core agent loop.
@@ -101,7 +103,16 @@ def run_agent(
     ]
     if run_id is None:
         run_id = uuid.uuid4().hex[:8]
-    _log_step(run_id, {"event": "start", "task": task, "provider": str(provider)})
+
+    def emit_event(record: dict) -> None:
+        log_record = dict(record)
+        if log_record.get("event") == "tool_call" and isinstance(log_record.get("result"), str):
+            log_record["result"] = log_record["result"][:500]
+        _log_step(run_id, log_record)
+        if event_callback:
+            event_callback(record)
+
+    emit_event({"event": "start", "task": task, "provider": str(provider)})
 
     step = 0
     while step<max_steps:
@@ -119,7 +130,10 @@ def run_agent(
         if not response.tool_calls:
             content = response.content or ""
             if m := FLAG_RE.search(content):
-                return f"FLAG FOUND: {m.group(0)}"
+                answer = f"FLAG FOUND: {m.group(0)}"
+                emit_event({"event": "final", "step": step, "answer": answer})
+                return answer
+            emit_event({"event": "final", "step": step, "answer": content})
             return content
 
         dispatch = tool_dispatcher or call_tool
@@ -145,20 +159,22 @@ def run_agent(
                 spinner.println(f"  ✓ {tc.name}({args_str}) → {result_preview}")
 
             result = str(result)
-            _log_step(run_id, {"event": "tool_call", "step": step,
-                               "tool": tc.name, "args": tc.arguments,
-                               "result": result[:500]})
+            emit_event({"event": "tool_call", "step": step,
+                        "tool": tc.name, "args": tc.arguments,
+                        "result": result})
             if m := FLAG_RE.search(result):
                 messages.append({"role": "tool", "tool_call_id": tc.id,
                                  "content": result})
-                _log_step(run_id, {"event":"flag", "step": step, "flag": m.group(0)})
-                return f"FLAG FOUND: {m.group(0)}"
+                emit_event({"event":"flag", "step": step, "flag": m.group(0)})
+                answer = f"FLAG FOUND: {m.group(0)}"
+                emit_event({"event": "final", "step": step, "answer": answer})
+                return answer
             messages.append({"role": "tool","tool_call_id": tc.id,
                              "content" : result})
             
             
             
-    _log_step(run_id, {"event": "end", "success": False, "steps": step})
+    emit_event({"event": "end", "success": False, "steps": step})
 
     return f"[max_steps={max_steps} reached — no final answer]" 
 

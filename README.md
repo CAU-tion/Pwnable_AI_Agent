@@ -56,3 +56,15 @@ Agent에게 Web, Pwnable 등 분야별 보안 도구와 실행 환경을 제공�
 
 최종적으로 **Harness의 구성에 따라 Agent의 문제 해결 성능이 어떻게 달라지는지 분석**하고,  
 효율적인 보안 워게임 풀이 Agent 구조를 탐구합니다.
+
+---
+
+### 분석 보고서 저장
+
+단일 실행 결과와 도구 호출 과정은 `--output`으로 Markdown 또는 텍스트 파일에 저장할 수 있습니다.
+
+```bash
+python agent.py --file ./challenge --output analysis.md "Analyze this pwnable challenge"
+```
+
+`--output`은 `.md`와 `.txt` 확장자를 지원하며, 대화형 모드에서는 사용할 수 없습니다.
