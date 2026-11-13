@@ -44,7 +44,7 @@ Rules:
 
 Typical workflow:
 1. Identify the provided challenge files.
-2. Inspect file type, architecture, and security protections.
+2. Inspect file type and architecture; use elf_security for ELF protections.
 3. Analyze program behavior and relevant code paths.
 4. Identify candidate vulnerabilities.
 5. Verify assumptions using available tools.

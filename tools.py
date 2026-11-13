@@ -107,6 +107,64 @@ def elf_headers(path: str) -> str:
     return _run(["readelf", "-W", "-h", "-l", "--", str(p)])
 
 
+def elf_security(path: str) -> str:
+    """Summarize common ELF exploit mitigations from readelf metadata."""
+    p = _safe_file(path)
+    header = _run(["readelf", "-W", "-h", "--", str(p)])
+    program_headers = _run(["readelf", "-W", "-l", "--", str(p)])
+    dynamic = _run(["readelf", "-W", "-d", "--", str(p)])
+    symbols = _run(["readelf", "-W", "--dyn-syms", "--", str(p)])
+
+    for output in (header, program_headers, dynamic, symbols):
+        if output.startswith("Error:"):
+            return output
+    if "ELF Header:" not in header:
+        return "Error: file is not a readable ELF binary"
+
+    type_match = re.search(r"^\s*Type:\s+(\S+)", header, re.MULTILINE)
+    elf_type = type_match.group(1) if type_match else "unknown"
+    has_interp = re.search(r"^\s*INTERP\s", program_headers, re.MULTILINE) is not None
+    if elf_type == "EXEC":
+        pie = "No (ET_EXEC)"
+    elif elf_type == "DYN" and has_interp:
+        pie = "Yes (ET_DYN with PT_INTERP)"
+    elif elf_type == "DYN":
+        pie = "Not applicable or not detected (ET_DYN without PT_INTERP)"
+    else:
+        pie = f"Unknown (ELF type {elf_type})"
+
+    stack_match = re.search(
+        r"^\s*GNU_STACK\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+([A-Z-]+)",
+        program_headers,
+        re.MULTILINE,
+    )
+    if stack_match:
+        stack_flags = stack_match.group(1)
+        nx = "Disabled (executable GNU_STACK)" if "E" in stack_flags else "Enabled"
+    else:
+        nx = "Unknown (GNU_STACK not present)"
+
+    has_relro = re.search(r"^\s*GNU_RELRO\s", program_headers, re.MULTILINE) is not None
+    bind_now = "BIND_NOW" in dynamic or re.search(r"FLAGS_1.*\bNOW\b", dynamic) is not None
+    if has_relro and bind_now:
+        relro = "Full"
+    elif has_relro:
+        relro = "Partial"
+    else:
+        relro = "None"
+
+    canary = "Detected" if re.search(r"__stack_chk_(?:fail|guard)", symbols) else "Not detected"
+    return (
+        f"ELF security summary: {p.name}\n"
+        f"ELF type: {elf_type}\n"
+        f"PIE: {pie}\n"
+        f"NX: {nx}\n"
+        f"RELRO: {relro}\n"
+        f"Stack canary: {canary}\n"
+        "Note: mitigations are inferred from ELF headers, segments, dynamic tags, and symbols."
+    )
+
+
 def elf_symbols(path: str, keyword: str = "") -> str:
     """List ELF symbols; optionally filter by a case-insensitive substring."""
     p = _safe_file(path)
@@ -202,6 +260,7 @@ TOOL_FUNCTIONS = {
     "file_info": file_info,
     "read_file": read_file,
     "elf_headers": elf_headers,
+    "elf_security": elf_security,
     "elf_symbols": elf_symbols,
     "extract_strings": extract_strings,
     "disassemble": disassemble,
@@ -235,6 +294,7 @@ TOOL_SCHEMAS: list[dict] = [
     _schema("file_info", "Identify a challenge file's type, size, architecture hints.", {"path": _PATH}, ["path"]),
     _schema("read_file", "Read a UTF-8 challenge source or text file (not a binary).", {"path": _PATH}, ["path"]),
     _schema("elf_headers", "Read ELF header and program headers using readelf. Use for architecture, PIE type and GNU_STACK/RELRO clues; do not infer full checksec from this alone.", {"path": _PATH}, ["path"]),
+    _schema("elf_security", "Summarize common ELF protections: PIE, NX, RELRO, and stack canary. Use on ELF challenge binaries; results are metadata-based indicators.", {"path": _PATH}, ["path"]),
     _schema("elf_symbols", "List functions and symbols from an ELF file, optionally filtered.", {
         "path": _PATH,
         "keyword": {"type": "string", "description": "Optional case-insensitive name substring"},
