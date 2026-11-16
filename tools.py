@@ -227,12 +227,15 @@ def elf_relocations(path: str, keyword: str = "") -> str:
     )
 
 
-def search_rop_gadgets(path: str, keyword: str = "", limit: int = 40) -> str:
+def search_rop_gadgets(path: str, keyword: str = "", limit: int = 40,
+                       depth: int = 20) -> str:
     """Search a challenge ELF for ROP gadgets, optionally filtering the output."""
     if not isinstance(keyword, str) or len(keyword) > 100:
         return "Error: keyword must be a string of at most 100 characters"
     if type(limit) is not int or not 1 <= limit <= 100:
         return "Error: limit must be between 1 and 100"
+    if type(depth) is not int or not 8 <= depth <= 64:
+        return "Error: depth must be between 8 and 64 bytes"
 
     p = _safe_file(path)
     executable = shutil.which("ROPgadget")
@@ -245,7 +248,7 @@ def search_rop_gadgets(path: str, keyword: str = "", limit: int = 40) -> str:
     if executable is None:
         return "Error: ROPgadget is not installed; install project requirements in the Linux/WSL environment"
 
-    argv = [executable, "--binary", str(p)]
+    argv = [executable, "--binary", str(p), "--depth", str(depth)]
     first_instruction = re.match(r"\s*([a-z][a-z0-9]*)\b", keyword.lower())
     if first_instruction and first_instruction.group(1) in {
         "add", "and", "call", "inc", "lea", "mov", "neg", "not", "or",
@@ -394,7 +397,7 @@ def debug_binary(path: str, breakpoint: str, input_hex: str = "",
         ])
         result = subprocess.run(
             argv,
-            cwd=WORKSPACE,
+            cwd=p.parent,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -726,10 +729,11 @@ TOOL_SCHEMAS: list[dict] = [
         "path": _PATH,
         "keyword": {"type": "string", "description": "Optional case-insensitive substring to filter relocation lines, such as a function name"},
     }, ["path"]),
-    _schema("search_rop_gadgets", "Search a challenge ELF for ROP gadgets. Use filters such as 'pop rdi', 'pop rsi', 'mov rdx', 'xchg rsp', or 'call rax' when building a chain.", {
+    _schema("search_rop_gadgets", "Search a challenge ELF for ROP gadgets. The default 20-byte depth includes multi-pop CSU sequences; raise it up to 64 for longer gadgets. Use filters such as 'pop rdi', 'pop rsi', 'mov rdx', 'xchg rsp', or 'call rax' when building a chain.", {
         "path": _PATH,
         "keyword": {"type": "string", "description": "Optional case-insensitive text to find in gadget instructions"},
         "limit": {"type": "integer", "description": "Maximum matching gadgets to return (1-100, default 40)"},
+        "depth": {"type": "integer", "description": "Maximum gadget byte depth (8-64, default 20; use at least 12 for CSU pop sequences)"},
     }, ["path"]),
     _schema("dump_elf_section", "Dump bytes and addresses from an ELF section. Useful for .data, .rodata, .bss, and .init_array analysis.", {
         "path": _PATH,

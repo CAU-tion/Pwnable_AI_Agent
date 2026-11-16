@@ -164,6 +164,20 @@ class PwnToolTests(unittest.TestCase):
         self.assertIn("0x00000000004006a3 : pop rdi ; ret", result)
         self.assertNotIn("pop rsi", result)
 
+    def test_rop_gadget_search_depth_includes_multi_pop_csu_gadgets(self):
+        csu_gadget = (
+            "0x000000000040069a : pop rbx ; pop rbp ; pop r12 ; "
+            "pop r13 ; pop r14 ; pop r15 ; ret\n"
+        )
+        with patch.object(tools, "_safe_file", return_value=tools.WORKSPACE / "fixture"):
+            with patch.object(tools.shutil, "which", return_value="/usr/bin/ROPgadget"):
+                with patch.object(tools, "_run", return_value=csu_gadget) as run:
+                    result = tools.search_rop_gadgets("fixture", keyword="pop rbx")
+
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[argv.index("--depth") + 1], "20")
+        self.assertIn("pop rbx ; pop rbp ; pop r12", result)
+
     def test_section_dump_and_byte_search_return_addresses(self):
         with tempfile.TemporaryDirectory() as directory:
             binary = Path(directory) / "fixture"
@@ -208,6 +222,7 @@ class PwnToolTests(unittest.TestCase):
         self.assertIn("break *(pwnme+0x98)", argv)
         self.assertIn("info registers rip rax", argv)
         self.assertIn("Breakpoint 1", result)
+        self.assertEqual(run.call_args.kwargs["cwd"], binary.parent)
 
     def test_debug_tool_rejects_gdb_command_injection(self):
         result = tools.debug_binary("fixture", breakpoint="pwnme; shell id")
