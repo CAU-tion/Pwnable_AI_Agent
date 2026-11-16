@@ -1,15 +1,20 @@
-"""Read-only starter tools for an authorized, local Pwnable/CTF agent.
+"""Local analysis and exploit-validation tools for authorized Pwnable/CTF work.
 
-Only files inside <project>/workspace can be inspected. The tools never execute
-challenge binaries or accept arbitrary shell commands.
+Challenge files are restricted to <project>/workspace. External analysis tools
+use fixed argument lists; run_exploit executes only workspace/exploit.py.
 """
 
 from __future__ import annotations
 
 import ast
+import os
 import operator
 import re
+import shlex
+import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +26,7 @@ MAX_EXPLOIT_SIZE = 100 * 1024     # 100 KiB per generated exploit
 MAX_OUTPUT = 8000                 # characters returned to the LLM per tool call
 COMMAND_TIMEOUT = 10              # seconds per external command
 MAX_CYCLIC_LENGTH = 4096          # keep generated patterns within model context
+MAX_DEBUG_INPUT = 64 * 1024       # bytes passed to a local GDB run
 _CYCLIC_ALPHABET = "abcdefghijklmnopqrstuvwxyz"
 
 
@@ -221,6 +227,198 @@ def elf_relocations(path: str, keyword: str = "") -> str:
     )
 
 
+def search_rop_gadgets(path: str, keyword: str = "", limit: int = 40) -> str:
+    """Search a challenge ELF for ROP gadgets, optionally filtering the output."""
+    if not isinstance(keyword, str) or len(keyword) > 100:
+        return "Error: keyword must be a string of at most 100 characters"
+    if type(limit) is not int or not 1 <= limit <= 100:
+        return "Error: limit must be between 1 and 100"
+
+    p = _safe_file(path)
+    executable = shutil.which("ROPgadget")
+    if executable is None:
+        venv_executable = Path(sys.prefix) / (
+            "Scripts/ROPgadget.exe" if os.name == "nt" else "bin/ROPgadget"
+        )
+        if venv_executable.is_file():
+            executable = str(venv_executable)
+    if executable is None:
+        return "Error: ROPgadget is not installed; install project requirements in the Linux/WSL environment"
+
+    argv = [executable, "--binary", str(p)]
+    first_instruction = re.match(r"\s*([a-z][a-z0-9]*)\b", keyword.lower())
+    if first_instruction and first_instruction.group(1) in {
+        "add", "and", "call", "inc", "lea", "mov", "neg", "not", "or",
+        "pop", "push", "ret", "sub", "syscall", "xchg", "xor",
+    }:
+        mnemonic = first_instruction.group(1)
+        allowed = mnemonic if mnemonic == "ret" else f"{mnemonic}|ret"
+        argv.extend(["--only", allowed])
+
+    raw = _run(argv)
+    if raw.startswith("Error:"):
+        return raw
+    gadgets = [
+        line.strip()
+        for line in raw.splitlines()
+        if re.match(r"\s*0x[0-9a-fA-F]+\s*:", line)
+        and (not keyword or keyword.casefold() in line.casefold())
+    ]
+    if not gadgets:
+        return "No matching ROP gadgets were found"
+    excerpt = "\n".join(gadgets[:limit])
+    return excerpt + (f"\n[showing {limit} of {len(gadgets)} matching gadgets]" if len(gadgets) > limit else "")
+
+
+def dump_elf_section(path: str, section: str) -> str:
+    """Show bytes and addresses for a named ELF section such as .data or .init_array."""
+    if not isinstance(section, str) or len(section) > 80 or not re.fullmatch(r"[A-Za-z0-9_.$-]+", section):
+        return "Error: invalid ELF section name"
+    p = _safe_file(path)
+    return _run(["objdump", "-s", "-j", section, "--", str(p)])
+
+
+def search_elf_bytes(path: str, pattern: str, limit: int = 20) -> str:
+    """Find text or hex bytes in a file and map ELF loadable bytes to virtual addresses."""
+    if not isinstance(pattern, str) or not pattern or len(pattern) > 512:
+        return "Error: pattern must contain 1 to 512 characters"
+    if type(limit) is not int or not 1 <= limit <= 100:
+        return "Error: limit must be between 1 and 100"
+
+    if pattern[:4].casefold() == "hex:":
+        try:
+            needle = bytes.fromhex(pattern[4:])
+        except ValueError as exc:
+            return f"Error: invalid hex pattern: {exc}"
+    else:
+        needle = pattern.encode("utf-8")
+    if not needle or len(needle) > 256:
+        return "Error: search pattern must contain 1 to 256 bytes"
+
+    p = _safe_file(path)
+    data = p.read_bytes()
+    offsets: list[int] = []
+    cursor = 0
+    while len(offsets) < limit + 1:
+        cursor = data.find(needle, cursor)
+        if cursor < 0:
+            break
+        offsets.append(cursor)
+        cursor += 1
+    if not offsets:
+        return "No matching bytes were found"
+
+    load_segments: list[tuple[int, int, int]] = []
+    if data.startswith(b"\x7fELF"):
+        headers = _run(["readelf", "-W", "-l", "--", str(p)])
+        if not headers.startswith("Error:"):
+            for line in headers.splitlines():
+                fields = line.split()
+                if fields and fields[0] == "LOAD" and len(fields) >= 6:
+                    try:
+                        load_segments.append((
+                            int(fields[1], 0),
+                            int(fields[2], 0),
+                            int(fields[4], 0),
+                        ))
+                    except ValueError:
+                        continue
+
+    results = []
+    for offset in offsets[:limit]:
+        addresses = [
+            virtual_address + offset - file_offset
+            for file_offset, virtual_address, file_size in load_segments
+            if file_offset <= offset < file_offset + file_size
+        ]
+        address_text = ", ".join(f"ELF VA 0x{address:x}" for address in addresses)
+        row = f"file offset 0x{offset:x}"
+        if address_text:
+            row += f" -> {address_text}"
+        results.append(row)
+
+    suffix = f"\n[showing {limit} of at least {len(offsets)} matches]" if len(offsets) > limit else ""
+    if load_segments:
+        suffix += "\nELF virtual addresses are relative to the image; PIE needs its runtime base."
+    return "\n".join(results) + suffix
+
+
+def debug_binary(path: str, breakpoint: str, input_hex: str = "",
+                 registers: str = "rip,rsp,rax,rdi,rsi,rdx", instructions: int = 6) -> str:
+    """Run a bounded GDB inspection at one breakpoint with selected registers."""
+    breakpoint_pattern = r"(?:0[xX][0-9a-fA-F]+|[A-Za-z_.$][A-Za-z0-9_.$@]*(?:\+0[xX]?[0-9a-fA-F]+)?)"
+    if not isinstance(breakpoint, str) or not re.fullmatch(breakpoint_pattern, breakpoint):
+        return "Error: breakpoint must be a symbol, symbol+offset, or hex address"
+    if not isinstance(input_hex, str) or len(input_hex) > MAX_DEBUG_INPUT * 2 + 256:
+        return f"Error: debug input exceeds {MAX_DEBUG_INPUT} bytes"
+    if type(instructions) is not int or not 1 <= instructions <= 16:
+        return "Error: instructions must be between 1 and 16"
+
+    register_names = {
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "rip",
+        "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip",
+    }
+    if not isinstance(registers, str):
+        return "Error: registers must be a comma-separated list"
+    requested_registers = list(dict.fromkeys(part.strip().lower() for part in registers.split(",") if part.strip()))
+    if not requested_registers or len(requested_registers) > 12 or any(name not in register_names for name in requested_registers):
+        return "Error: select up to 12 supported x86/x86-64 registers"
+
+    try:
+        input_bytes = bytes.fromhex(input_hex) if input_hex.strip() else b""
+    except ValueError as exc:
+        return f"Error: invalid hex input: {exc}"
+    if len(input_bytes) > MAX_DEBUG_INPUT:
+        return f"Error: debug input exceeds {MAX_DEBUG_INPUT} bytes"
+
+    p = _safe_file(path)
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        argv = ["gdb", "-q", "-batch", "-nx", "-ex", "set pagination off", "-ex", "set confirm off"]
+        argv.extend(["-ex", f"break *({breakpoint})"])
+        if input_bytes:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=WORKSPACE, prefix=".gdb-input-", delete=False
+            ) as input_file:
+                input_file.write(input_bytes)
+                temp_path = Path(input_file.name)
+            argv.extend(["-ex", f"run < {shlex.quote(str(temp_path))}"])
+        else:
+            argv.extend(["-ex", "run"])
+        argv.extend([
+            "-ex", f"x/{instructions}i $pc",
+            "-ex", f"info registers {' '.join(requested_registers)}",
+            "-ex", "bt 5",
+            str(p),
+        ])
+        result = subprocess.run(
+            argv,
+            cwd=WORKSPACE,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=COMMAND_TIMEOUT,
+            check=False,
+        )
+    except FileNotFoundError:
+        return "Error: GDB is not installed in the agent's Linux/WSL environment"
+    except subprocess.TimeoutExpired as exc:
+        partial = exc.stdout or ""
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", errors="replace")
+        return f"Error: GDB timed out after {COMMAND_TIMEOUT}s\n{partial[:MAX_OUTPUT]}"
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+    output = (result.stdout + ("\n" + result.stderr if result.stderr else "")).strip()
+    if result.returncode != 0:
+        return f"Error: GDB returned exit code {result.returncode}\n{output[:MAX_OUTPUT]}"
+    return output[:MAX_OUTPUT] + ("\n[output truncated]" if len(output) > MAX_OUTPUT else "")
+
+
 def _de_bruijn_prefix(alphabet: str, width: int, length: int) -> str:
     """Generate a prefix whose width-sized windows are unique."""
     base = len(alphabet)
@@ -394,7 +592,72 @@ def write_exploit(code: str) -> str:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
 
-    return "Saved syntactically valid exploit source to workspace/exploit.py. It was not executed."
+    return "Saved syntax-checked exploit source to workspace/exploit.py. Call run_exploit to test it against the provided authorized CTF challenge."
+
+
+def run_exploit(arguments: list[str] | None = None, timeout: int = 15) -> str:
+    """Run workspace/exploit.py with a time limit and return output/status for repair."""
+    if type(timeout) is not int or not 1 <= timeout <= 60:
+        return "Error: timeout must be between 1 and 60 seconds"
+    if arguments is None:
+        arguments = []
+    if (
+        not isinstance(arguments, list)
+        or len(arguments) > 16
+        or any(not isinstance(arg, str) or "\x00" in arg or len(arg) > 500 for arg in arguments)
+    ):
+        return "Error: arguments must be a list of at most 16 strings (500 characters each)"
+
+    try:
+        exploit_path = _safe_file("exploit.py")
+    except (FileNotFoundError, ValueError) as exc:
+        return f"Error: {exc}"
+    if exploit_path.stat().st_size > MAX_EXPLOIT_SIZE:
+        return f"Error: exploit source exceeds {MAX_EXPLOIT_SIZE // 1024} KiB"
+
+    try:
+        process = subprocess.Popen(
+            [sys.executable, str(exploit_path), *arguments],
+            cwd=WORKSPACE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=(os.name == "posix"),
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
+            stdout, stderr = process.communicate()
+            return (
+                f"Timed out after {timeout}s; exploit process was stopped.\n"
+                f"STDOUT:\n{stdout[-MAX_OUTPUT:]}\nSTDERR:\n{stderr[-MAX_OUTPUT:]}"
+            )
+    except OSError as exc:
+        return f"Error: could not run exploit with {sys.executable}: {exc}"
+
+    status = f"Exit code: {process.returncode}"
+    if process.returncode is not None and process.returncode < 0:
+        try:
+            status += f" (terminated by {signal.Signals(-process.returncode).name})"
+        except ValueError:
+            pass
+    output = [status]
+    if stdout:
+        output.append(f"STDOUT:\n{stdout[-MAX_OUTPUT:]}")
+    if stderr:
+        output.append(f"STDERR:\n{stderr[-MAX_OUTPUT:]}")
+    if process.returncode:
+        output.append("Exploit did not exit successfully; use the output to revise the script.")
+    return "\n".join(output)
 
 
 def get_current_date() -> str:
@@ -410,12 +673,17 @@ TOOL_FUNCTIONS = {
     "elf_symbols": elf_symbols,
     "elf_imports": elf_imports,
     "elf_relocations": elf_relocations,
+    "search_rop_gadgets": search_rop_gadgets,
+    "dump_elf_section": dump_elf_section,
+    "search_elf_bytes": search_elf_bytes,
+    "debug_binary": debug_binary,
     "cyclic_pattern": cyclic_pattern,
     "find_cyclic_offset": find_cyclic_offset,
     "extract_strings": extract_strings,
     "disassemble": disassemble,
     "calculate": calculate,
     "write_exploit": write_exploit,
+    "run_exploit": run_exploit,
     "get_current_date": get_current_date,
 }
 
@@ -458,6 +726,27 @@ TOOL_SCHEMAS: list[dict] = [
         "path": _PATH,
         "keyword": {"type": "string", "description": "Optional case-insensitive substring to filter relocation lines, such as a function name"},
     }, ["path"]),
+    _schema("search_rop_gadgets", "Search a challenge ELF for ROP gadgets. Use filters such as 'pop rdi', 'pop rsi', 'mov rdx', 'xchg rsp', or 'call rax' when building a chain.", {
+        "path": _PATH,
+        "keyword": {"type": "string", "description": "Optional case-insensitive text to find in gadget instructions"},
+        "limit": {"type": "integer", "description": "Maximum matching gadgets to return (1-100, default 40)"},
+    }, ["path"]),
+    _schema("dump_elf_section", "Dump bytes and addresses from an ELF section. Useful for .data, .rodata, .bss, and .init_array analysis.", {
+        "path": _PATH,
+        "section": {"type": "string", "description": "Section name, for example .data or .init_array"},
+    }, ["path", "section"]),
+    _schema("search_elf_bytes", "Search embedded text or bytes in a challenge binary and report file offsets plus ELF virtual addresses when possible. Prefix a pattern with 'hex:' for raw bytes.", {
+        "path": _PATH,
+        "pattern": {"type": "string", "description": "UTF-8 text such as 'flag.txt' or hex bytes such as 'hex:666c61672e74787400'"},
+        "limit": {"type": "integer", "description": "Maximum matches to return (1-100, default 20)"},
+    }, ["path", "pattern"]),
+    _schema("debug_binary", "Run a challenge binary under GDB at one validated breakpoint and return selected registers, nearby instructions, and a short backtrace.", {
+        "path": _PATH,
+        "breakpoint": {"type": "string", "description": "Symbol, symbol+offset (for example pwnme+0x98), or hex address"},
+        "input_hex": {"type": "string", "description": "Optional stdin bytes as hex; whitespace is allowed"},
+        "registers": {"type": "string", "description": "Comma-separated x86/x86-64 registers, for example rip,rsp,rax (default rip,rsp,rax,rdi,rsi,rdx)"},
+        "instructions": {"type": "integer", "description": "Number of nearby instructions to show, from 1 to 16 (default 6)"},
+    }, ["path", "breakpoint"]),
     _schema("cyclic_pattern", "Generate a bounded de Bruijn pattern for measuring a buffer overwrite offset. Use width 4 for 32-bit values or width 8 for 64-bit values.", {
         "length": {"type": "integer", "description": "Pattern length from 1 to 4096 bytes"},
         "width": {"type": "integer", "description": "Crash value width: 4 or 8 bytes (default 4)"},
@@ -479,9 +768,13 @@ TOOL_SCHEMAS: list[dict] = [
     _schema("calculate", "Basic arithmetic and integer bitwise operations, including hex addresses. No Python function calls.", {
         "expression": {"type": "string", "description": "Expression, e.g. '2 ** 10' or '0x401000 + 0x30'"},
     }, ["expression"]),
-    _schema("write_exploit", "Save valid Python exploit source to workspace/exploit.py (replaces an existing generated file). Syntax is checked; the code is never executed.", {
+    _schema("write_exploit", "Save a complete Python exploit source to workspace/exploit.py (replaces an existing generated file). Python syntax is checked; call run_exploit to execute and test it against the authorized challenge.", {
         "code": {"type": "string", "description": "Complete Python source code for the authorized CTF exploit."},
     }, ["code"]),
+    _schema("run_exploit", "Run workspace/exploit.py with a maximum 60-second limit. Returns exit status and stdout/stderr so you can diagnose crashes and revise the exploit. Use only for the provided authorized CTF challenge.", {
+        "arguments": {"type": "array", "items": {"type": "string"}, "description": "Optional command-line arguments for the exploit script"},
+        "timeout": {"type": "integer", "description": "Maximum runtime in seconds, from 1 to 60 (default 15)"},
+    }, []),
     _schema("get_current_date", "Return local date and time.", {}, []),
 ]
 

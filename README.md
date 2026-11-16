@@ -69,7 +69,7 @@ python agent.py --file ./challenge --output analysis.md "Analyze this pwnable ch
 
 `--output`은 `.md`와 `.txt` 확장자를 지원하며, 대화형 모드에서는 사용할 수 없습니다. 보고서에는 입력 작업, 도구 호출 과정, 도구 결과, 최종 답변이 포함됩니다.
 
-Agent가 익스플로잇 코드를 작성하면 문법을 확인한 뒤 `workspace/exploit.py`에 저장합니다. 저장된 코드는 자동으로 실행하지 않습니다.
+Agent가 익스플로잇 코드를 작성하면 문법을 확인한 뒤 `workspace/exploit.py`에 저장합니다. `run_exploit` 도구는 해당 파일을 제한 시간 안에 실행하고 종료 코드와 표준 출력/오류를 Agent에 돌려줘서, 실패 원인을 살펴보고 다시 수정할 수 있게 합니다.
 
 ### Pwnable 분석 도구
 
@@ -77,7 +77,13 @@ Agent는 아래 도구를 이용해 ELF 바이너리의 익스플로잇 단서�
 
 - `elf_imports`: ELF가 동적으로 불러오는 함수 목록을 확인합니다. `puts`, `read`, `system` 등 관심 함수 이름으로 필터링할 수 있습니다.
 - `elf_relocations`: 함수의 GOT/PLT 재배치 항목과 ELF 내 주소를 확인합니다. PIE 바이너리의 실제 실행 주소를 얻으려면 별도로 런타임 베이스 주소를 알아야 합니다.
+- `search_rop_gadgets`: ROPgadget으로 `pop rdi`, `xchg rsp` 같은 가젯을 검색합니다.
+- `dump_elf_section` / `search_elf_bytes`: `.data`, `.init_array` 내용을 보거나 바이너리 안의 문자열과 가상 주소를 찾습니다.
 - `cyclic_pattern`: 4바이트 또는 8바이트 값이 서로 구분되는 패턴을 최대 4096바이트까지 만듭니다.
 - `find_cyclic_offset`: 같은 길이와 폭으로 만든 패턴에서 크래시 시점의 레지스터 값을 찾아 오프셋을 계산합니다. `0x...` 레지스터 값은 기본적으로 little-endian으로 해석합니다.
+- `debug_binary`: GDB에서 지정한 위치의 레지스터와 명령어를 확인합니다.
+- `run_exploit`: 저장된 `exploit.py`를 실행하고 결과를 반환합니다. 실패 출력에 따라 코드를 고친 뒤 다시 실행할 수 있습니다.
 
-일반적인 사용 흐름은 `elf_imports`/`elf_relocations`로 호출 가능한 함수와 관련 주소를 살펴본 뒤, 오버플로우가 의심되면 패턴을 만들어 대상 프로그램에 입력하고 크래시 레지스터 값을 `find_cyclic_offset`에 넣는 것입니다. 이 도구들은 바이너리를 직접 실행하거나 크래시를 발생시키지 않으며, 오프셋은 입력한 패턴과 레지스터 값이 같은 실행에서 나온 경우에만 유효합니다.
+일반적인 사용 흐름은 보호기법과 함수·가젯을 확인하고, 필요하면 크래시 오프셋과 레지스터 상태를 측정한 다음 익스플로잇을 작성·실행하는 것입니다. `run_exploit`은 `workspace/exploit.py`만 최대 60초 실행하며, Flag나 성공을 실제 출력에서 확인해야 합니다. 문제 폴더를 통째로 지정하면 Agent가 관련 파일의 폴더 배치를 유지해 복사합니다. 대상 프로그램이 주변 파일을 상대 경로로 읽는다면 익스플로잇에서 `process(elf.path, cwd=os.path.dirname(elf.path))`처럼 실행 디렉터리를 지정해야 합니다. pwntools와 GDB 사용은 Linux/WSL 환경을 권장합니다.
+
+Linux/WSL에서 Python 가상환경을 활성화한 뒤 `pip install -r requirements.txt`를 실행하고, 시스템 도구 `file`, `binutils`, `gdb`를 설치합니다. Ubuntu/WSL에서는 `sudo apt install file binutils gdb`를 사용할 수 있습니다.

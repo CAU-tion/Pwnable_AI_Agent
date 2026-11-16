@@ -134,13 +134,23 @@ class CircuitBreaker:
 _TYPE_MAP = {"string": str, "number": float, "integer": int, "boolean": bool}
 
 
+def _python_type(spec: dict):
+    """Translate the JSON schema types used by tools into Python types."""
+    value_type = spec.get("type", "string")
+    if value_type == "array":
+        item_spec = spec.get("items", {})
+        item_type = _TYPE_MAP.get(item_spec.get("type", "string"), str)
+        return list[item_type]
+    return _TYPE_MAP.get(value_type, str)
+
+
 def _build_validator(schema: dict):
     """Build a pydantic model from a JSON schema parameters block."""
     props = schema.get("properties", {})
     required = set(schema.get("required", []))
     fields = {}
     for field, spec in props.items():
-        py_type = _TYPE_MAP.get(spec.get("type", "string"), str)
+        py_type = _python_type(spec)
         fields[field] = (py_type, ...) if field in required else (Optional[py_type], None)
     return create_model("ToolArgs", **fields)
 

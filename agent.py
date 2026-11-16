@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -37,8 +38,11 @@ Rules:
 - Do not invent command outputs, file contents, addresses, offsets,
   protections, vulnerabilities, or tool results.
 - Base conclusions on evidence obtained from the challenge and tools.
-- When an exploit is warranted or explicitly requested, save its Python source with write_exploit.
-- A saved exploit has not been executed; never claim it was tested unless it actually was.
+- Build exploit code from observed symbols, offsets, gadgets, and protections; do not invent addresses or payload layouts.
+- Save a complete Python exploit with write_exploit, then use run_exploit on the supplied local challenge when available.
+- When a challenge binary uses relative files, launch it with the binary's parent directory as its process cwd.
+- Treat exit status, stdout, and stderr as evidence. If it crashes or fails, use debug_binary or other tools, revise the code, and retry.
+- Report success only when the exploit output actually shows the challenge result or flag.
 - After each tool result, reassess the current hypothesis before
   choosing the next action.
 - Keep track of useful findings such as protections, vulnerabilities,
@@ -48,14 +52,22 @@ Rules:
 Typical workflow:
 1. Identify the provided challenge files.
 2. Inspect file type and architecture; use elf_security for ELF protections.
-3. Analyze program behavior and relevant code paths. For ELF files, use
-   elf_imports to identify imported functions and elf_relocations to inspect
-   their GOT/PLT entries when relevant.
-4. Identify candidate vulnerabilities and verify assumptions using available tools.
-   For a buffer overwrite, generate a cyclic_pattern; if a crash register value
-   is supplied, use find_cyclic_offset with the same pattern length and width.
-5. Generate and save exploit source when appropriate; report execution status honestly.
-6. Record failed attempts and avoid repeating them.
+3. Analyze program behavior and relevant code paths. Use elf_imports and
+   elf_relocations for imported functions and GOT/PLT entries, search_rop_gadgets
+   for candidate gadgets, and dump_elf_section or search_elf_bytes for data
+   sections and embedded strings.
+4. Verify candidate vulnerabilities. For a buffer overwrite, use cyclic_pattern
+   and find_cyclic_offset. Use debug_binary to inspect a relevant breakpoint,
+   registers, and instructions when static output is not enough.
+5. Write a complete exploit based on observed evidence. Prefer pwntools ELF/ROP
+   helpers for addresses and packing, match send() versus sendline() to the
+   target's input behavior, and set process(elf.path, cwd=os.path.dirname(elf.path))
+   when the challenge expects files relative to its binary.
+6. Save the code with write_exploit. If a local challenge binary is available,
+   run it with run_exploit, inspect its output and exit status, then revise and
+   retry after failures. Continue until the challenge succeeds or evidence shows
+   what is still missing.
+7. Record failed attempts and avoid repeating them.
 
 When challenge files are provided, inspect the actual files using tools.
 Never assume their contents from their filenames alone.
@@ -151,10 +163,12 @@ def resolve_files(paths: list[str]) -> list[Path]:
 
 @contextmanager
 def stage_challenge_files(files: list[Path]) -> Iterator[list[Path]]:
-    """Copy explicitly provided challenge files into the tools' safe workspace.
+    """Copy challenge files into the safe workspace and preserve sibling paths.
 
     The temporary directory lives under WORKSPACE so every staged file passes
-    tools._safe_file(), and is removed when the agent run finishes.
+    tools._safe_file(), and is removed when the agent run finishes. Files with
+    a shared parent keep their relative layout so binaries can find adjacent
+    data files and libraries during local execution.
     """
     if not files:
         yield []
@@ -164,16 +178,24 @@ def stage_challenge_files(files: list[Path]) -> Iterator[list[Path]]:
     with tempfile.TemporaryDirectory(prefix=".run-", dir=WORKSPACE) as temp_dir:
         staging_root = Path(temp_dir)
         staged_files: list[Path] = []
+        sources = [Path(source_path).resolve(strict=True) for source_path in files]
+        try:
+            common_parent = Path(os.path.commonpath([str(source.parent) for source in sources]))
+        except ValueError:
+            # Different drives/filesystems cannot share a relative tree.
+            common_parent = None
 
-        for index, source_path in enumerate(files, start=1):
-            source = Path(source_path).resolve(strict=True)
+        for index, source in enumerate(sources, start=1):
             if not source.is_file():
-                raise ValueError(f"Challenge input is not a file: {source_path}")
+                raise ValueError(f"Challenge input is not a file: {source}")
 
-            # One directory per input prevents collisions when files share a name.
-            target_dir = staging_root / f"{index:03d}"
-            target_dir.mkdir()
-            target = target_dir / source.name
+            relative_path = (
+                source.relative_to(common_parent)
+                if common_parent is not None
+                else Path(f"{index:03d}") / source.name
+            )
+            target = staging_root / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
             staged_files.append(target)
 

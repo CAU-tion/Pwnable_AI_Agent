@@ -1,24 +1,49 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import core
+import agent
+import reliability
 import tools
 from providers import LLMMessage, ToolCall
 
 
 class PwnToolTests(unittest.TestCase):
+    def test_staging_keeps_sibling_challenge_files_together(self):
+        with tempfile.TemporaryDirectory() as directory:
+            challenge_dir = Path(directory) / "challenge"
+            challenge_dir.mkdir()
+            binary = challenge_dir / "ret2win"
+            flag_file = challenge_dir / "flag.txt"
+            binary.write_bytes(b"ELF fixture")
+            flag_file.write_text("ROPE{test_flag}\n", encoding="utf-8")
+
+            with agent.stage_challenge_files([binary, flag_file]) as staged:
+                staged_binary, staged_flag = staged
+                self.assertEqual(staged_binary.parent, staged_flag.parent)
+                self.assertEqual(staged_binary.read_bytes(), b"ELF fixture")
+                self.assertEqual(staged_flag.read_text(encoding="utf-8"), "ROPE{test_flag}\n")
+
     def test_new_tools_are_available_to_the_agent(self):
         expected = {
             "elf_imports",
             "elf_relocations",
             "cyclic_pattern",
             "find_cyclic_offset",
+            "search_rop_gadgets",
+            "dump_elf_section",
+            "search_elf_bytes",
+            "debug_binary",
+            "run_exploit",
         }
         self.assertTrue(expected.issubset(tools.TOOL_FUNCTIONS))
         schema_names = {item["function"]["name"] for item in tools.TOOL_SCHEMAS}
         self.assertTrue(expected.issubset(schema_names))
+        for name in expected:
+            self.assertIn(name, agent.PWNABLE_SYSTEM_PROMPT)
 
     def test_agent_executes_a_cyclic_tool_call_and_returns_its_result_to_provider(self):
         class OneToolProvider:
@@ -123,6 +148,106 @@ class PwnToolTests(unittest.TestCase):
         self.assertIn("000000404000", got_entry)
         self.assertIn("puts@GLIBC", got_entry)
         self.assertNotIn("read@GLIBC", got_entry)
+
+    def test_rop_gadget_search_returns_matching_gadgets(self):
+        gadget_output = (
+            "Gadgets information\n"
+            "0x00000000004006a3 : pop rdi ; ret\n"
+            "0x00000000004006a1 : pop rsi ; pop r15 ; ret\n"
+            "Unique gadgets found: 2\n"
+        )
+        with patch.object(tools, "_safe_file", return_value=tools.WORKSPACE / "fixture"):
+            with patch.object(tools.shutil, "which", return_value="/usr/bin/ROPgadget"):
+                with patch.object(tools, "_run", return_value=gadget_output):
+                    result = tools.search_rop_gadgets("fixture", keyword="pop rdi")
+
+        self.assertIn("0x00000000004006a3 : pop rdi ; ret", result)
+        self.assertNotIn("pop rsi", result)
+
+    def test_section_dump_and_byte_search_return_addresses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "fixture"
+            binary.write_bytes(b"\x7fELF" + (b"\x00" * 12) + b"flag.txt\x00" + b"\x00" * 16)
+            with patch.object(tools, "_safe_file", return_value=binary):
+                with patch.object(tools, "_run", return_value="Contents of section .data:"):
+                    section = tools.dump_elf_section("fixture", ".data")
+                with patch.object(
+                    tools,
+                    "_run",
+                    return_value=(
+                        "Program Headers:\n"
+                        "  LOAD 0x0000000000000000 0x0000000000400000 0x0000000000400000 0x0000000000000100 0x0000000000000100 R E 0x1000\n"
+                    ),
+                ):
+                    found = tools.search_elf_bytes("fixture", "flag.txt")
+
+        self.assertIn("Contents of section .data", section)
+        self.assertIn("file offset 0x10", found)
+        self.assertIn("ELF VA 0x400010", found)
+
+    def test_debug_tool_builds_a_bounded_gdb_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "fixture"
+            binary.write_bytes(b"fixture")
+            with patch.object(tools, "_safe_file", return_value=binary):
+                with patch.object(
+                    tools.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(stdout="Breakpoint 1, rax=0x41", stderr="", returncode=0),
+                ) as run:
+                    result = tools.debug_binary(
+                        "fixture",
+                        breakpoint="pwnme+0x98",
+                        input_hex="41424344",
+                        registers="rip,rax",
+                        instructions=4,
+                    )
+
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[0], "gdb")
+        self.assertIn("break *(pwnme+0x98)", argv)
+        self.assertIn("info registers rip rax", argv)
+        self.assertIn("Breakpoint 1", result)
+
+    def test_debug_tool_rejects_gdb_command_injection(self):
+        result = tools.debug_binary("fixture", breakpoint="pwnme; shell id")
+        self.assertTrue(result.startswith("Error:"))
+
+    def test_run_exploit_returns_exit_status_and_captured_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / "exploit.py").write_text(
+                "import sys\nprint('exploit stdout')\nprint('exploit stderr', file=sys.stderr)\n",
+                encoding="utf-8",
+            )
+            with patch.object(tools, "WORKSPACE", workspace):
+                result = tools.run_exploit()
+
+        self.assertIn("Exit code: 0", result)
+        self.assertIn("exploit stdout", result)
+        self.assertIn("exploit stderr", result)
+
+    def test_run_exploit_reports_timeouts_to_the_agent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / "exploit.py").write_text(
+                "import time\ntime.sleep(3)\n", encoding="utf-8"
+            )
+            with patch.object(tools, "WORKSPACE", workspace):
+                result = tools.run_exploit(timeout=1)
+
+        self.assertIn("Timed out after 1s", result)
+
+    def test_reliable_dispatcher_accepts_run_exploit_string_arguments(self):
+        with patch.object(reliability, "call_tool", return_value="ran") as dispatch:
+            result = reliability.validated_call(
+                "run_exploit", {"arguments": ["--local"], "timeout": 3}
+            )
+
+        self.assertEqual(result, "ran")
+        dispatch.assert_called_once_with(
+            "run_exploit", {"arguments": ["--local"], "timeout": 3}
+        )
 
 
 if __name__ == "__main__":
