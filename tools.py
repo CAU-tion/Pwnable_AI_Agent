@@ -20,6 +20,8 @@ MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MiB per inspected file
 MAX_EXPLOIT_SIZE = 100 * 1024     # 100 KiB per generated exploit
 MAX_OUTPUT = 8000                 # characters returned to the LLM per tool call
 COMMAND_TIMEOUT = 10              # seconds per external command
+MAX_CYCLIC_LENGTH = 4096          # keep generated patterns within model context
+_CYCLIC_ALPHABET = "abcdefghijklmnopqrstuvwxyz"
 
 
 def _safe_file(path: str) -> Path:
@@ -180,6 +182,112 @@ def elf_symbols(path: str, keyword: str = "") -> str:
     return excerpt[:MAX_OUTPUT] + ("\n[output truncated]" if len(lines) > 80 or len(excerpt) > MAX_OUTPUT else "")
 
 
+def elf_imports(path: str, keyword: str = "") -> str:
+    """List undefined dynamic symbols, which often reveal useful libc calls."""
+    p = _safe_file(path)
+    raw = _run(["readelf", "-W", "--dyn-syms", "--", str(p)])
+    if raw.startswith("Error:"):
+        return raw
+    imports = [
+        line.strip()
+        for line in raw.splitlines()
+        if re.search(r"\bUND\b", line)
+        and (not keyword or keyword.lower() in line.lower())
+    ]
+    if not imports:
+        return "No matching undefined dynamic symbols were found"
+    excerpt = "\n".join(imports[:80])
+    return excerpt[:MAX_OUTPUT] + (
+        "\n[imports truncated]" if len(imports) > 80 or len(excerpt) > MAX_OUTPUT else ""
+    )
+
+
+def elf_relocations(path: str, keyword: str = "") -> str:
+    """List ELF relocations, including GOT/PLT entries used in common exploits."""
+    p = _safe_file(path)
+    raw = _run(["readelf", "-W", "-r", "--", str(p)])
+    if raw.startswith("Error:"):
+        return raw
+    lines = [
+        line.rstrip()
+        for line in raw.splitlines()
+        if not keyword or keyword.lower() in line.lower()
+    ]
+    if not lines:
+        return "No matching relocations were found"
+    excerpt = "\n".join(lines[:100])
+    return excerpt[:MAX_OUTPUT] + (
+        "\n[relocations truncated]" if len(lines) > 100 or len(excerpt) > MAX_OUTPUT else ""
+    )
+
+
+def _de_bruijn_prefix(alphabet: str, width: int, length: int) -> str:
+    """Generate a prefix whose width-sized windows are unique."""
+    base = len(alphabet)
+    working = [0] * (base * width)
+    result: list[str] = []
+
+    def visit(position: int, period: int) -> None:
+        if len(result) >= length:
+            return
+        if position > width:
+            if width % period == 0:
+                for index in working[1 : period + 1]:
+                    result.append(alphabet[index])
+                    if len(result) >= length:
+                        return
+            return
+
+        working[position] = working[position - period]
+        visit(position + 1, period)
+        for index in range(working[position - period] + 1, base):
+            if len(result) >= length:
+                return
+            working[position] = index
+            visit(position + 1, position)
+
+    visit(1, 1)
+    return "".join(result)
+
+
+def cyclic_pattern(length: int, width: int = 4) -> str:
+    """Generate a bounded de Bruijn pattern for finding overwrite offsets."""
+    if type(length) is not int or not 1 <= length <= MAX_CYCLIC_LENGTH:
+        return f"Error: length must be between 1 and {MAX_CYCLIC_LENGTH}"
+    if type(width) is not int or width not in {4, 8}:
+        return "Error: width must be 4 or 8 bytes"
+    return _de_bruijn_prefix(_CYCLIC_ALPHABET, width, length)
+
+
+def find_cyclic_offset(value: str, length: int = MAX_CYCLIC_LENGTH,
+                       width: int = 4, endian: str = "little") -> str:
+    """Find a crash value in a generated pattern (hex register values supported)."""
+    if type(length) is not int or not 1 <= length <= MAX_CYCLIC_LENGTH:
+        return f"Error: length must be between 1 and {MAX_CYCLIC_LENGTH}"
+    if type(width) is not int or width not in {4, 8}:
+        return "Error: width must be 4 or 8 bytes"
+    if endian not in {"little", "big"}:
+        return "Error: endian must be 'little' or 'big'"
+    if not isinstance(value, str) or not value:
+        return "Error: value must be a hex register value or a byte string"
+
+    try:
+        if re.fullmatch(r"0[xX][0-9a-fA-F]+", value):
+            needle = int(value, 16).to_bytes(width, endian, signed=False)
+        else:
+            needle = value.encode("latin-1")
+            if len(needle) != width:
+                return f"Error: byte-string value must be exactly {width} bytes"
+    except (OverflowError, ValueError) as exc:
+        return f"Error: {exc}"
+
+    pattern = _de_bruijn_prefix(_CYCLIC_ALPHABET, width, length + width - 1)
+    offset = pattern.encode("ascii").find(needle)
+    if offset < 0 or offset >= length:
+        return f"No offset found in the first {length} bytes of the pattern"
+    return f"Offset: {offset} (width={width}, endian={endian})"
+
+
 def extract_strings(path: str, keyword: str = "") -> str:
     """Extract printable strings from a file; optionally filter by substring."""
     p = _safe_file(path)
@@ -300,6 +408,10 @@ TOOL_FUNCTIONS = {
     "elf_headers": elf_headers,
     "elf_security": elf_security,
     "elf_symbols": elf_symbols,
+    "elf_imports": elf_imports,
+    "elf_relocations": elf_relocations,
+    "cyclic_pattern": cyclic_pattern,
+    "find_cyclic_offset": find_cyclic_offset,
     "extract_strings": extract_strings,
     "disassemble": disassemble,
     "calculate": calculate,
@@ -338,6 +450,24 @@ TOOL_SCHEMAS: list[dict] = [
         "path": _PATH,
         "keyword": {"type": "string", "description": "Optional case-insensitive name substring"},
     }, ["path"]),
+    _schema("elf_imports", "List undefined dynamic symbols imported by an ELF binary. Use to identify useful libc functions such as puts, read, write, system, or gets.", {
+        "path": _PATH,
+        "keyword": {"type": "string", "description": "Optional case-insensitive substring to filter imported symbol names"},
+    }, ["path"]),
+    _schema("elf_relocations", "List ELF relocations, including GOT/PLT entries. Use to find addresses for imported functions when planning a leak or GOT overwrite.", {
+        "path": _PATH,
+        "keyword": {"type": "string", "description": "Optional case-insensitive substring to filter relocation lines, such as a function name"},
+    }, ["path"]),
+    _schema("cyclic_pattern", "Generate a bounded de Bruijn pattern for measuring a buffer overwrite offset. Use width 4 for 32-bit values or width 8 for 64-bit values.", {
+        "length": {"type": "integer", "description": "Pattern length from 1 to 4096 bytes"},
+        "width": {"type": "integer", "description": "Crash value width: 4 or 8 bytes (default 4)"},
+    }, ["length"]),
+    _schema("find_cyclic_offset", "Find where a crashed register value occurs in the cyclic pattern. For a hex register value such as 0x6161616c, endian defaults to little.", {
+        "value": {"type": "string", "description": "Hex register value (for example 0x6161616c) or exactly width bytes copied from the crash"},
+        "length": {"type": "integer", "description": "Length of the original pattern, from 1 to 4096 bytes (default 4096)"},
+        "width": {"type": "integer", "description": "Register value width: 4 or 8 bytes (default 4)"},
+        "endian": {"type": "string", "description": "Byte order used to display the register value: little (default) or big"},
+    }, ["value"]),
     _schema("extract_strings", "Show printable strings in a challenge file, optionally filtered. This is not the complete file content.", {
         "path": _PATH,
         "keyword": {"type": "string", "description": "Optional case-insensitive substring"},

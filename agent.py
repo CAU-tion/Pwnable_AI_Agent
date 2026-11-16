@@ -48,11 +48,14 @@ Rules:
 Typical workflow:
 1. Identify the provided challenge files.
 2. Inspect file type and architecture; use elf_security for ELF protections.
-3. Analyze program behavior and relevant code paths.
-4. Identify candidate vulnerabilities.
-5. Verify assumptions using available tools.
-6. Generate and save exploit source when appropriate; report execution status honestly.
-7. Record failed attempts and avoid repeating them.
+3. Analyze program behavior and relevant code paths. For ELF files, use
+   elf_imports to identify imported functions and elf_relocations to inspect
+   their GOT/PLT entries when relevant.
+4. Identify candidate vulnerabilities and verify assumptions using available tools.
+   For a buffer overwrite, generate a cyclic_pattern; if a crash register value
+   is supplied, use find_cyclic_offset with the same pattern length and width.
+5. Generate and save exploit source when appropriate; report execution status honestly.
+6. Record failed attempts and avoid repeating them.
 
 When challenge files are provided, inspect the actual files using tools.
 Never assume their contents from their filenames alone.
