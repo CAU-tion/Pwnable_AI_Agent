@@ -23,7 +23,8 @@ import random
 import re
 import time
 from collections import defaultdict
-from typing import Callable, Optional
+from collections.abc import Callable
+from typing import Optional
 
 from pydantic import ValidationError, create_model
 
@@ -32,6 +33,22 @@ from tools import TOOL_SCHEMAS, call_tool
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S", level=logging.INFO)
 _log = logging.getLogger("reliability")
+
+
+def _is_retryable_exception(exc: Exception) -> bool:
+    """Return whether an exception is likely to clear without changing inputs."""
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code in {408, 409, 429} or status_code >= 500
+
+    exception_names = {base.__name__.lower() for base in type(exc).__mro__}
+    if any(
+        "timeout" in name or "connection" in name or "network" in name
+        for name in exception_names
+    ):
+        return True
+    return isinstance(exc, (TimeoutError, ConnectionError))
+
 
 # Build a name → parameters-schema index once at import time.
 _SCHEMAS: dict[str, dict] = {
@@ -50,12 +67,12 @@ def with_retry(
     max_attempts: int = 3,
     base_delay: float = 1.0,
 ) -> str:
-    """Call fn(**args), retrying up to max_attempts times on any exception."""
+    """Call fn(**args), retrying transient failures up to max_attempts times."""
     for attempt in range(max_attempts):
         try:
             return fn(**args)
         except Exception as e:
-            if attempt == max_attempts - 1:
+            if attempt == max_attempts - 1 or not _is_retryable_exception(e):
                 raise
             delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
             _log.warning("attempt %d failed (%s) — retrying in %.1fs", attempt + 1, e, delay)
@@ -117,13 +134,23 @@ class CircuitBreaker:
 _TYPE_MAP = {"string": str, "number": float, "integer": int, "boolean": bool}
 
 
+def _python_type(spec: dict):
+    """Translate the JSON schema types used by tools into Python types."""
+    value_type = spec.get("type", "string")
+    if value_type == "array":
+        item_spec = spec.get("items", {})
+        item_type = _TYPE_MAP.get(item_spec.get("type", "string"), str)
+        return list[item_type]
+    return _TYPE_MAP.get(value_type, str)
+
+
 def _build_validator(schema: dict):
     """Build a pydantic model from a JSON schema parameters block."""
     props = schema.get("properties", {})
     required = set(schema.get("required", []))
     fields = {}
     for field, spec in props.items():
-        py_type = _TYPE_MAP.get(spec.get("type", "string"), str)
+        py_type = _python_type(spec)
         fields[field] = (py_type, ...) if field in required else (Optional[py_type], None)
     return create_model("ToolArgs", **fields)
 
@@ -211,6 +238,7 @@ def run_agent_reliable(
     llm_max_retries: int = 5,
     circuit_failure_threshold: int = 3,
     circuit_reset_timeout: float = 30.0,
+    event_callback: Callable[[dict], None] | None = None,
 ) -> str:
     """
     run_agent() with retry, circuit breaker, schema validation, and tracing
@@ -232,6 +260,7 @@ def run_agent_reliable(
         system_prompt=system_prompt,
         verbose=verbose,
         tool_dispatcher=_make_dispatcher(breakers, max_retries),
+        event_callback=event_callback,
     )
 
 
@@ -240,7 +269,7 @@ def run_agent_reliable(
 # -------------------------------------------------
 
 class _RetryingProvider:
-    """Wraps any LLMProvider and adds exponential-backoff retry to complete()."""
+    """Wraps any LLMProvider and retries transient complete() failures."""
 
     def __init__(self, inner, max_retries: int = 5, base_delay: float = 2.0) -> None:
         self._inner = inner
@@ -252,7 +281,7 @@ class _RetryingProvider:
             try:
                 return self._inner.complete(messages, tools)
             except Exception as e:
-                if attempt == self._max_retries - 1:
+                if attempt == self._max_retries - 1 or not _is_retryable_exception(e):
                     raise
                 delay = self._base_delay * (2 ** attempt) + random.uniform(0, 1.0)
                 _log.warning(

@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import shutil
 import sys
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 try:
@@ -14,6 +20,7 @@ except ImportError:
 
 from providers import create_provider
 from reliability import run_agent_reliable
+from tools import WORKSPACE
 
 
 DEFAULT_MODEL = "gemini-3.6-flash"
@@ -31,6 +38,11 @@ Rules:
 - Do not invent command outputs, file contents, addresses, offsets,
   protections, vulnerabilities, or tool results.
 - Base conclusions on evidence obtained from the challenge and tools.
+- Build exploit code from observed symbols, offsets, gadgets, and protections; do not invent addresses or payload layouts.
+- Save a complete Python exploit with write_exploit, then use run_exploit on the supplied local challenge when available.
+- When a challenge binary uses relative files, launch it with the binary's parent directory as its process cwd.
+- Treat exit status, stdout, and stderr as evidence. If it crashes or fails, use debug_binary or other tools, revise the code, and retry.
+- Report success only when the exploit output actually shows the challenge result or flag.
 - After each tool result, reassess the current hypothesis before
   choosing the next action.
 - Keep track of useful findings such as protections, vulnerabilities,
@@ -39,11 +51,22 @@ Rules:
 
 Typical workflow:
 1. Identify the provided challenge files.
-2. Inspect file type, architecture, and security protections.
-3. Analyze program behavior and relevant code paths.
-4. Identify candidate vulnerabilities.
-5. Verify assumptions using available tools.
-6. Build and test an exploit incrementally when appropriate.
+2. Inspect file type and architecture; use elf_security for ELF protections.
+3. Analyze program behavior and relevant code paths. Use elf_imports and
+   elf_relocations for imported functions and GOT/PLT entries, search_rop_gadgets
+   for candidate gadgets, and dump_elf_section or search_elf_bytes for data
+   sections and embedded strings.
+4. Verify candidate vulnerabilities. For a buffer overwrite, use cyclic_pattern
+   and find_cyclic_offset. Use debug_binary to inspect a relevant breakpoint,
+   registers, and instructions when static output is not enough.
+5. Write a complete exploit based on observed evidence. Prefer pwntools ELF/ROP
+   helpers for addresses and packing, match send() versus sendline() to the
+   target's input behavior, and set process(elf.path, cwd=os.path.dirname(elf.path))
+   when the challenge expects files relative to its binary.
+6. Save the code with write_exploit. If a local challenge binary is available,
+   run it with run_exploit, inspect its output and exit status, then revise and
+   retry after failures. Continue until the challenge succeeds or evidence shows
+   what is still missing.
 7. Record failed attempts and avoid repeating them.
 
 When challenge files are provided, inspect the actual files using tools.
@@ -83,6 +106,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "-q",
         action="store_true",
         help="Hide tool execution trace.",
+    )
+
+    parser.add_argument(
+        "--output",
+        "-o",
+        help="Write the task, tool trace, and final answer to a .md or .txt report.",
     )
 
     parser.add_argument(
@@ -131,6 +160,48 @@ def resolve_files(paths: list[str]) -> list[Path]:
 
     return resolved_files
 
+
+@contextmanager
+def stage_challenge_files(files: list[Path]) -> Iterator[list[Path]]:
+    """Copy challenge files into the safe workspace and preserve sibling paths.
+
+    The temporary directory lives under WORKSPACE so every staged file passes
+    tools._safe_file(), and is removed when the agent run finishes. Files with
+    a shared parent keep their relative layout so binaries can find adjacent
+    data files and libraries during local execution.
+    """
+    if not files:
+        yield []
+        return
+
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".run-", dir=WORKSPACE) as temp_dir:
+        staging_root = Path(temp_dir)
+        staged_files: list[Path] = []
+        sources = [Path(source_path).resolve(strict=True) for source_path in files]
+        try:
+            common_parent = Path(os.path.commonpath([str(source.parent) for source in sources]))
+        except ValueError:
+            # Different drives/filesystems cannot share a relative tree.
+            common_parent = None
+
+        for index, source in enumerate(sources, start=1):
+            if not source.is_file():
+                raise ValueError(f"Challenge input is not a file: {source}")
+
+            relative_path = (
+                source.relative_to(common_parent)
+                if common_parent is not None
+                else Path(f"{index:03d}") / source.name
+            )
+            target = staging_root / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            staged_files.append(target)
+
+        yield staged_files
+
+
 def build_task(task: str, files: list[Path]) -> str:
     """
     사용자 요청과 challenge 파일 정보를 하나의 Agent task로 합친다.
@@ -144,14 +215,96 @@ def build_task(task: str, files: list[Path]) -> str:
         parts.append("\nProvided challenge files:")
 
         for path in files:
-            parts.append(f"- {path}")
+            try:
+                relative_path = path.resolve().relative_to(WORKSPACE).as_posix()
+            except ValueError as exc:
+                raise ValueError(
+                    "Challenge files must be staged inside workspace/ before building the task"
+                ) from exc
+            parts.append(f"- {relative_path}")
 
         parts.append(
-            "\nInspect these files using the available tools before "
+            "\nThese paths are relative to workspace/. Inspect the files "
+            "using the available tools before "
             "drawing conclusions."
         )
 
     return "\n".join(parts)
+
+
+def write_analysis_report(
+    report_path: str | Path,
+    task: str,
+    answer: str,
+    events: list[dict],
+) -> Path:
+    """Write the final answer and observed tool trace to Markdown or text."""
+    path = Path(report_path).expanduser()
+    suffix = path.suffix.lower()
+    if suffix not in {".md", ".txt"}:
+        raise ValueError("Report path must end with .md or .txt")
+
+    tool_calls = [event for event in events if event.get("event") == "tool_call"]
+    if suffix == ".md":
+        lines = [
+            "# Pwnable Analysis Report",
+            "",
+            "## Task",
+            "",
+            task,
+            "",
+            "## Analysis process",
+            "",
+        ]
+        if tool_calls:
+            for event in tool_calls:
+                args = json.dumps(event.get("args", {}), ensure_ascii=False, sort_keys=True)
+                lines.extend(
+                    [
+                        f"### Step {event.get('step', '?')}: `{event.get('tool', 'unknown')}`",
+                        "",
+                        f"Arguments: `{args}`",
+                        "",
+                        "Result:",
+                    ]
+                )
+                result = str(event.get("result", ""))
+                quoted_result = [f"> {line}" if line else ">" for line in result.splitlines()]
+                lines.extend(quoted_result or [">"])
+                lines.append("")
+        else:
+            lines.extend(["No tools were called.", ""])
+        lines.extend(["## Final answer", "", answer, ""])
+    else:
+        lines = [
+            "PWNABLE ANALYSIS REPORT",
+            "=" * 24,
+            "",
+            "TASK",
+            "----",
+            task,
+            "",
+            "ANALYSIS PROCESS",
+            "-----------------",
+        ]
+        if tool_calls:
+            for event in tool_calls:
+                args = json.dumps(event.get("args", {}), ensure_ascii=False, sort_keys=True)
+                lines.extend([
+                    f"Step {event.get('step', '?')}: {event.get('tool', 'unknown')}",
+                    f"Arguments: {args}",
+                    "Result:",
+                    str(event.get("result", "")),
+                    "",
+                ])
+        else:
+            lines.extend(["No tools were called.", ""])
+        lines.extend(["FINAL ANSWER", "------------", answer, ""])
+
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
 
 
 def run_task(
@@ -159,27 +312,43 @@ def run_task(
     model: str,
     files: list[Path] | None = None,
     verbose: bool = True,
+    report_path: str | Path | None = None,
 ) -> str:
 
     if files is None:
         files = []
 
-    full_task = build_task(
-        task=task,
-        files=files,
-    )
+    if report_path is not None:
+        report = Path(report_path).expanduser()
+        if report.suffix.lower() not in {".md", ".txt"}:
+            raise ValueError("Report path must end with .md or .txt")
+        if report.exists() and report.is_dir():
+            raise ValueError("Report path points to a directory")
+        if report.resolve() in {Path(file).resolve() for file in files}:
+            raise ValueError("Report path cannot overwrite a provided challenge file")
 
-    provider = create_provider(
-        "gemini",
-        model,
-    )
+    with stage_challenge_files(files) as staged_files:
+        full_task = build_task(
+            task=task,
+            files=staged_files,
+        )
 
-    return run_agent_reliable(
-        task=full_task,
-        provider=provider,
-        system_prompt=PWNABLE_SYSTEM_PROMPT,
-        verbose=verbose,
-    )
+        provider = create_provider(
+            "gemini",
+            model,
+        )
+
+        events: list[dict] = []
+        answer = run_agent_reliable(
+            task=full_task,
+            provider=provider,
+            system_prompt=PWNABLE_SYSTEM_PROMPT,
+            verbose=verbose,
+            event_callback=events.append if report_path is not None else None,
+        )
+        if report_path is not None:
+            write_analysis_report(report_path, full_task, answer, events)
+        return answer
 
 
 def run_interactive(
@@ -258,6 +427,8 @@ def main() -> None:
     print()
 
     if args.interactive:
+        if args.output:
+            parser.error("--output cannot be combined with --interactive")
         run_interactive(
             model=args.model,
             files=challenge_files,
@@ -286,9 +457,12 @@ def main() -> None:
             model=args.model,
             files=challenge_files,
             verbose=verbose,
+            report_path=args.output,
         )
 
         print(f"\nAnswer: {answer}\n")
+        if args.output:
+            print(f"Report written to: {Path(args.output).expanduser().resolve()}")
 
     except KeyboardInterrupt:
         print("\nInterrupted.")
