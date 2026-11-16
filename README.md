@@ -75,6 +75,8 @@ Agent가 익스플로잇 코드를 작성하면 문법을 확인한 뒤 `workspa
 
 Agent는 아래 도구를 이용해 ELF 바이너리의 익스플로잇 단서를 찾고, 버퍼 오버플로우 입력 길이를 계산할 수 있습니다.
 
+팀 공유용으로 변경 이유와 Agent 실행 흐름, 검증 결과를 [Agent 도구·익스플로잇 변경 설명](docs/agent-tools-explained.md)에 정리했습니다.
+
 - `elf_imports`: ELF가 동적으로 불러오는 함수 목록을 확인합니다. `puts`, `read`, `system` 등 관심 함수 이름으로 필터링할 수 있습니다.
 - `elf_relocations`: 함수의 GOT/PLT 재배치 항목과 ELF 내 주소를 확인합니다. PIE 바이너리의 실제 실행 주소를 얻으려면 별도로 런타임 베이스 주소를 알아야 합니다.
 - `search_rop_gadgets`: ROPgadget으로 `pop rdi`, `xchg rsp` 같은 가젯을 검색합니다. 기본 깊이 20바이트는 ret2csu의 다중 pop 가젯도 포함하며, 최대 64바이트까지 조정할 수 있습니다.
