@@ -88,8 +88,12 @@ def file_info(path: str) -> str:
     return f"File: {p.name}\nSize: {p.stat().st_size} bytes\nType: {detected}"
 
 
-def read_file(path: str) -> str:
-    """Read a *text* source/config file. For binaries use the other tools."""
+def read_file(path: str, start_line: int = 1, end_line: int | None = None) -> str:
+    """Read an inclusive, 1-based text line range with continuation metadata."""
+    if type(start_line) is not int or start_line < 1:
+        return "Error: start_line must be an integer >= 1"
+    if end_line is not None and (type(end_line) is not int or end_line < start_line):
+        return "Error: end_line must be an integer >= start_line"
     p = _safe_file(path)
     raw = p.read_bytes()
     if b"\x00" in raw[:1024]:
@@ -98,7 +102,42 @@ def read_file(path: str) -> str:
         content = raw.decode("utf-8")
     except UnicodeDecodeError:
         return "Error: not valid UTF-8 text; use extract_strings or file_info"
-    return content[:MAX_OUTPUT] + ("\n[output truncated]" if len(content) > MAX_OUTPUT else "")
+    lines = content.splitlines()
+    total = len(lines)
+    if not lines:
+        return "Total lines: 0\n[empty file]"
+    if start_line > total:
+        return f"Error: start_line {start_line} exceeds total lines ({total})"
+
+    last_requested = min(end_line if end_line is not None else total, total)
+    # Reserve room for metadata, and only return complete numbered lines.
+    budget = MAX_OUTPUT - 512
+    numbered = []
+    used = 0
+    for index in range(start_line - 1, last_requested):
+        line = f"{index + 1}: {lines[index]}"
+        cost = len(line) + 1
+        if used + cost > budget:
+            if not numbered:
+                return (
+                    f"Error: line {index + 1} is too long to return in full within "
+                    f"the {MAX_OUTPUT}-character output limit. "
+                    "Line-range reading cannot split a single long line."
+                )
+            break
+        numbered.append(line)
+        used += cost
+
+    last_returned = start_line + len(numbered) - 1
+    header = f"Total lines: {total}\nReturned lines: {start_line}-{last_returned}\n\n"
+    footer = ""
+    if last_returned < last_requested:
+        footer += "\n[output truncated at a complete line]"
+    if last_returned < total:
+        footer += f"\nNext start_line: {last_returned + 1}"
+    else:
+        footer += "\n[end of file]"
+    return header + "\n".join(numbered) + footer
 
 
 def elf_headers(path: str) -> str:
@@ -233,7 +272,16 @@ _PATH = {
 TOOL_SCHEMAS: list[dict] = [
     _schema("list_files", "List available challenge files inside workspace/.", {}, []),
     _schema("file_info", "Identify a challenge file's type, size, architecture hints.", {"path": _PATH}, ["path"]),
-    _schema("read_file", "Read a UTF-8 challenge source or text file (not a binary).", {"path": _PATH}, ["path"]),
+    _schema("read_file", (
+        "Read a UTF-8 text file by inclusive, 1-based line range (not a binary). "
+        "Returns numbered complete lines, total lines and next start_line. "
+        "Output is limited to 8000 characters; if more evidence is needed, "
+        "continue using the returned next start_line. A single oversized line returns an error."
+    ), {
+        "path": _PATH,
+        "start_line": {"type": "integer", "description": "First line to read, starting at 1. Default: 1."},
+        "end_line": {"type": "integer", "description": "Last line to read, inclusive. Omit to read toward the end of the file."},
+    }, ["path"]),
     _schema("elf_headers", "Read ELF header and program headers using readelf. Use for architecture, PIE type and GNU_STACK/RELRO clues; do not infer full checksec from this alone.", {"path": _PATH}, ["path"]),
     _schema("elf_symbols", "List functions and symbols from an ELF file, optionally filtered.", {
         "path": _PATH,
